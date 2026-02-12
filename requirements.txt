@@ -1,3 +1,6 @@
 streamlit
-google-genai
+langchain
+langchain-community
+langchain-groq
 wikipedia
+pytest
