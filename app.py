@@ -31,8 +31,6 @@ def docs_to_urls(docs: List[Document], lang: str = "en") -> List[str]:
         title = (d.metadata or {}).get("title", "") if hasattr(d, "metadata") else ""
         if title:
             urls.append(build_wikipedia_url(title, lang=lang))
-
-    # Deduplicate while preserving order
     seen = set()
     unique = []
     for u in urls:
@@ -62,7 +60,7 @@ def make_llm(api_key: str, model_id: str, temperature: float = 0.2) -> ChatGroq:
 # -----------------------------
 def score_wiki_doc(title: str, content: str, query: str) -> int:
     """
-    Simple heuristic score to keep "industry-ish" pages and avoid random news/events.
+    Heuristic score — generous boosts, only hard negatives penalised.
     """
     t = (title or "").lower()
     c = (content or "").lower()
@@ -70,31 +68,37 @@ def score_wiki_doc(title: str, content: str, query: str) -> int:
 
     score = 0
 
-    # Query match in title
-    if q and q in t:
-        score += 12
+    # Strong boost: query words appear in title
+    query_words = [w for w in q.split() if len(w) > 3]
+    for w in query_words:
+        if w in t:
+            score += 10
 
-    # Industry-ish boosts
-    for kw in ["industry", "sector", "market", "economics", "health economics", "value chain", "supply chain"]:
+    # Industry / market keywords in title
+    for kw in ["industry", "sector", "market", "economics", "economy",
+               "manufacturing", "production", "trade", "commerce",
+               "value chain", "supply chain", "health", "technology",
+               "energy", "finance", "retail", "services"]:
         if kw in t:
-            score += 6
-        if kw in c:
-            score += 2
-
-    # Domain boosts (useful across many industries)
-    for kw in ["company", "companies", "business", "services", "manufacturing", "regulation"]:
-        if kw in t:
-            score += 2
+            score += 5
         if kw in c:
             score += 1
 
-    # Strong negatives (events / media / incidents)
-    for bad in [
-        "killing", "murder", "death", "shooting", "attack", "trial", "case",
-        "episode", "film", "song", "album", "game", "scandal"
-    ]:
+    # General business relevance in content
+    for kw in ["company", "companies", "business", "revenue", "billion",
+               "growth", "regulation", "employment", "export", "import"]:
+        if kw in c:
+            score += 1
+
+    # Penalise only very clearly off-topic pages (events, media, crimes)
+    hard_negatives = [
+        "killing", "murder", "shooting", "attack", "trial",
+        "television episode", "video game", "discography",
+        "filmography", "soundtrack"
+    ]
+    for bad in hard_negatives:
         if bad in t:
-            score -= 15
+            score -= 20
 
     return score
 
@@ -102,17 +106,12 @@ def score_wiki_doc(title: str, content: str, query: str) -> int:
 @st.cache_data(show_spinner=False)
 def retrieve_wikipedia_docs(query: str, lang: str = "en", max_docs: int = 5) -> List[Document]:
     """
-    Q2: return up to 5 relevant Wikipedia docs.
-    Fixes:
-    - top_k_results default is 3 -> set > 5
-    - pull multiple query variants
-    - deduplicate by title
-    - rerank by relevance
+    Q2: return up to 5 relevant Wikipedia docs using multiple query variants.
     """
     retriever = WikipediaRetriever(
         lang=lang,
-        top_k_results=25,
-        load_max_docs=25,
+        top_k_results=10,
+        load_max_docs=10,
     )
 
     candidate_queries = [
@@ -124,7 +123,6 @@ def retrieve_wikipedia_docs(query: str, lang: str = "en", max_docs: int = 5) -> 
     ]
 
     by_title = {}
-
     for q in candidate_queries:
         try:
             docs = retriever.invoke(q)
@@ -137,7 +135,8 @@ def retrieve_wikipedia_docs(query: str, lang: str = "en", max_docs: int = 5) -> 
 
     scored = []
     for title, doc in by_title.items():
-        scored.append((score_wiki_doc(title, doc.page_content, query), doc))
+        s = score_wiki_doc(title, doc.page_content, query)
+        scored.append((s, doc))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
@@ -225,7 +224,7 @@ with st.sidebar:
         """
 1) Enter an industry  
 2) Click **Find Wikipedia Pages** (Q2)  
-3) Paste your Groq key (if not already) and click **Generate Report** (Q3)
+3) Paste your Groq key and click **Generate Report** (Q3)
 """
     )
 
