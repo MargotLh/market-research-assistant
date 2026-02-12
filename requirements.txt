@@ -1,6 +1,5 @@
 streamlit
-langchain
-langchain-community
 langchain-groq
+langchain-community
+langchain-core
 wikipedia
-pytest
