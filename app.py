@@ -66,12 +66,48 @@ def make_llm(api_key: str, model_id: str, temperature: float = 0.2) -> ChatGroq:
 def retrieve_wikipedia_docs(query: str, lang: str = "en", max_docs: int = 5) -> List[Document]:
     """
     Q2 requirement: return URLs of the five most relevant Wikipedia pages.
-    We use WikipediaRetriever (LangChain) to get the most relevant docs,
-    then we derive URLs from titles.
+
+    Important:
+    - WikipediaRetriever returns TOP_K search results (default is 3),
+      so we must set top_k_results > 5, then deduplicate and keep max_docs.
+    - We also try a few related queries to increase the chance of getting 5 unique pages.
     """
-    retriever = WikipediaRetriever(lang=lang, load_max_docs=max_docs)
-    # Some people get better results with "X industry" than "X"
-    return retriever.invoke(f"{query} industry")
+    # Ask Wikipedia for more candidates than we need, then keep 5 unique
+    retriever = WikipediaRetriever(
+        lang=lang,
+        top_k_results=15,   # <-- key fix (default is 3)
+        load_max_docs=15,
+    )
+
+    candidate_queries = [
+        f"{query} industry",
+        f"{query} market",
+        f"{query} sector",
+        query,
+    ]
+
+    collected: List[Document] = []
+    seen_titles = set()
+
+    for q in candidate_queries:
+        try:
+            docs = retriever.invoke(q)
+        except Exception:
+            docs = []
+
+        for d in docs:
+            title = (d.metadata or {}).get("title", "")
+            if not title:
+                continue
+            if title in seen_titles:
+                continue
+            seen_titles.add(title)
+            collected.append(d)
+
+            if len(collected) >= max_docs:
+                return collected[:max_docs]
+
+    return collected[:max_docs]
 
 
 def generate_industry_report(
@@ -83,11 +119,10 @@ def generate_industry_report(
     """
     Q3 requirement: < 500 words, based on the five most relevant Wikipedia pages.
     """
-    # Keep context compact and consistent
     sources_blocks = []
     for i, d in enumerate(docs[:5], start=1):
         title = (d.metadata or {}).get("title", f"Source {i}")
-        snippet = (d.page_content or "")[:2500]  # limit per source
+        snippet = (d.page_content or "")[:2500]
         sources_blocks.append(f"SOURCE [{i}] — {title}\n{snippet}")
 
     sources_text = "\n\n---\n\n".join(sources_blocks)
@@ -126,7 +161,6 @@ Here is the report to shorten:
 """.strip()
         report = (llm.invoke(tighten).content or "").strip()
 
-    # Final safety: truncate if still too long
     if word_count(report) > max_words:
         report = truncate_to_words(report, max_words)
 
@@ -140,11 +174,9 @@ st.set_page_config(page_title="Market Research Assistant", page_icon="📊", lay
 st.title("📊 Market Research Assistant")
 st.caption("Generate an industry report grounded in Wikipedia pages (LangChain WikipediaRetriever + Groq LLM).")
 
-# Sidebar (assignment requirement)
 with st.sidebar:
     st.header("⚙️ Configuration")
 
-    # Keep only ONE model in the dropdown for the final version (assignment requirement)
     llm_model = st.selectbox(
         "Select LLM Model",
         ["llama-3.1-8b-instant"],
@@ -195,7 +227,7 @@ if find_pages:
         st.stop()
 
     st.session_state.industry = result
-    st.session_state.report = ""  # reset report when industry changes
+    st.session_state.report = ""
 
     with st.spinner("Retrieving relevant Wikipedia pages..."):
         docs = retrieve_wikipedia_docs(st.session_state.industry, lang="en", max_docs=5)
@@ -225,7 +257,9 @@ if st.session_state.docs:
 
             with st.spinner("Generating report with Groq..."):
                 llm = make_llm(api_key=api_key, model_id=llm_model, temperature=0.2)
-                report = generate_industry_report(llm, st.session_state.industry, st.session_state.docs, max_words=500)
+                report = generate_industry_report(
+                    llm, st.session_state.industry, st.session_state.docs, max_words=500
+                )
                 st.session_state.report = report
 
     with col2:
