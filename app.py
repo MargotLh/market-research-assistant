@@ -17,7 +17,7 @@ with st.sidebar:
     # LLM Selection
     llm_model = st.selectbox(
         "Select LLM Model",
-        ["gemini-2.0-flash-exp"],  # Can add more models during development
+        ["gemini-1.5-flash"],
         index=0
     )
     
@@ -61,7 +61,7 @@ def validate_industry(industry_input, api_key):
     try:
         # Configure Gemini
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
         # Use LLM to validate if input is indeed an industry
         prompt = f"""Is the following text a valid industry name or sector? 
@@ -89,7 +89,7 @@ def get_wikipedia_urls(industry, api_key):
     try:
         # Configure Gemini
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
         # Use WikipediaRetriever to get relevant pages
         retriever = WikipediaRetriever(top_k_results=10, lang="en")
@@ -138,7 +138,7 @@ def generate_report(industry, urls, api_key):
     try:
         # Configure Gemini
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
         # Retrieve content from URLs
         retriever = WikipediaRetriever(top_k_results=5, lang="en")
