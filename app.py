@@ -17,7 +17,7 @@ with st.sidebar:
     # LLM Selection
     llm_model = st.selectbox(
         "Select LLM Model",
-        ["gemini-1.5-flash"],
+        ["gemini-2.0-flash"],
         index=0
     )
     
