@@ -1,232 +1,256 @@
+import os
+from typing import List, Tuple
+
 import streamlit as st
-from google import genai
-import wikipedia
+from langchain_groq import ChatGroq
+from langchain_community.retrievers import WikipediaRetriever
+from langchain_core.documents import Document
 
-# Page configuration
-st.set_page_config(
-    page_title="Market Research Assistant",
-    page_icon="📊",
-    layout="wide"
-)
+# -----------------------------
+# Helpers (testable)
+# -----------------------------
+def validate_industry(industry_input: str) -> Tuple[bool, str]:
+    """
+    Q1 requirement: check that an industry is indeed provided.
+    No LLM needed for this check.
+    """
+    if industry_input is None:
+        return False, "Please provide an industry name."
+    cleaned = industry_input.strip()
+    if not cleaned:
+        return False, "Please provide an industry name (e.g., automotive, healthcare, retail)."
+    return True, cleaned
 
-# Sidebar
+
+def build_wikipedia_url(title: str, lang: str = "en") -> str:
+    safe_title = (title or "").strip().replace(" ", "_")
+    return f"https://{lang}.wikipedia.org/wiki/{safe_title}"
+
+
+def docs_to_urls(docs: List[Document], lang: str = "en") -> List[str]:
+    urls: List[str] = []
+    for d in docs:
+        title = (d.metadata or {}).get("title", "") if hasattr(d, "metadata") else ""
+        if title:
+            urls.append(build_wikipedia_url(title, lang=lang))
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            unique.append(u)
+    return unique
+
+
+def word_count(text: str) -> int:
+    return len([w for w in (text or "").split() if w.strip()])
+
+
+def truncate_to_words(text: str, max_words: int) -> str:
+    words = [w for w in (text or "").split() if w.strip()]
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words]).strip()
+
+
+def make_llm(api_key: str, model_id: str, temperature: float = 0.2) -> ChatGroq:
+    return ChatGroq(
+        api_key=api_key,
+        model=model_id,
+        temperature=temperature,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def retrieve_wikipedia_docs(query: str, lang: str = "en", max_docs: int = 5) -> List[Document]:
+    """
+    Q2 requirement: return URLs of the five most relevant Wikipedia pages.
+    We use WikipediaRetriever (LangChain) to get the most relevant docs,
+    then we derive URLs from titles.
+    """
+    retriever = WikipediaRetriever(lang=lang, load_max_docs=max_docs)
+    # Some people get better results with "X industry" than "X"
+    return retriever.invoke(f"{query} industry")
+
+
+def generate_industry_report(
+    llm: ChatGroq,
+    industry: str,
+    docs: List[Document],
+    max_words: int = 500,
+) -> str:
+    """
+    Q3 requirement: < 500 words, based on the five most relevant Wikipedia pages.
+    """
+    # Keep context compact and consistent
+    sources_blocks = []
+    for i, d in enumerate(docs[:5], start=1):
+        title = (d.metadata or {}).get("title", f"Source {i}")
+        snippet = (d.page_content or "")[:2500]  # limit per source
+        sources_blocks.append(f"SOURCE [{i}] — {title}\n{snippet}")
+
+    sources_text = "\n\n---\n\n".join(sources_blocks)
+
+    prompt = f"""
+You are a business analyst writing a market research brief on the "{industry}" industry.
+
+Use ONLY the information in the SOURCES below. Do not add outside facts.
+Write a clear industry report covering:
+1) Industry overview
+2) Key segments / value chain
+3) Major players (only if mentioned in sources)
+4) Trends
+5) Challenges & opportunities
+6) Near-term outlook
+
+Requirements:
+- Professional business tone
+- Strictly under {max_words} words
+- If something is not in sources, say "Not specified in the sources".
+
+SOURCES:
+{sources_text}
+""".strip()
+
+    report = (llm.invoke(prompt).content or "").strip()
+
+    if word_count(report) > max_words:
+        tighten = f"""
+Shorten the report to strictly under {max_words} words.
+Keep it accurate and based ONLY on the same sources.
+Remove repetition first.
+Here is the report to shorten:
+
+{report}
+""".strip()
+        report = (llm.invoke(tighten).content or "").strip()
+
+    # Final safety: truncate if still too long
+    if word_count(report) > max_words:
+        report = truncate_to_words(report, max_words)
+
+    return report
+
+
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+st.set_page_config(page_title="Market Research Assistant", page_icon="📊", layout="wide")
+st.title("📊 Market Research Assistant")
+st.caption("Generate an industry report grounded in Wikipedia pages (LangChain WikipediaRetriever + Groq LLM).")
+
+# Sidebar (assignment requirement)
 with st.sidebar:
     st.header("⚙️ Configuration")
 
+    # Keep only ONE model in the dropdown for the final version (assignment requirement)
     llm_model = st.selectbox(
         "Select LLM Model",
-        ["gemini-2.0-flash"],
-        index=0
+        ["llama-3.1-8b-instant"],
+        index=0,
+        help="Final submission should include only one LLM option.",
     )
 
-    api_key = st.text_input(
+    api_key_input = st.text_input(
         "Enter your API Key",
         type="password",
-        help="Get your free API key from https://aistudio.google.com/apikey"
+        help="Paste your Groq API key here (from https://console.groq.com).",
     )
 
     st.markdown("---")
-    st.markdown("### 📌 How to use")
-    st.markdown("""
-    1. Enter your Gemini API key
-    2. Type an industry name
-    3. Get your market research report
-    """)
+    st.markdown("### How to use")
+    st.markdown(
+        """
+1) Enter an industry  
+2) Click **Find Wikipedia Pages** (Q2)  
+3) Paste your Groq key (if not already) and click **Generate Report** (Q3)
+"""
+    )
 
-# Title
-st.title("📊 Market Research Assistant")
-st.markdown("Get comprehensive industry reports based on Wikipedia data")
-
-# Session state
-if 'step' not in st.session_state:
-    st.session_state.step = 1
-if 'industry' not in st.session_state:
+# Session state init
+if "industry" not in st.session_state:
     st.session_state.industry = ""
-if 'urls' not in st.session_state:
+if "docs" not in st.session_state:
+    st.session_state.docs = []
+if "urls" not in st.session_state:
     st.session_state.urls = []
-if 'report' not in st.session_state:
+if "report" not in st.session_state:
     st.session_state.report = ""
 
-def get_llm_response(api_key, prompt):
-    """Call Gemini API using new google-genai library"""
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=prompt
+# Step 1 (Q1)
+st.subheader("Step 1 — Provide an industry (Q1)")
+with st.form("industry_form", clear_on_submit=False):
+    industry_input = st.text_input(
+        "What industry would you like to research?",
+        value=st.session_state.industry,
+        placeholder="e.g., automotive, healthcare, renewable energy",
     )
-    return response.text.strip()
+    find_pages = st.form_submit_button("Find Wikipedia Pages", use_container_width=True)
 
-def validate_industry(industry_input, api_key):
-    """Step 1: Validate that a proper industry is provided"""
-    if not api_key:
-        return False, "Please enter your API key in the sidebar first."
-    if not industry_input or industry_input.strip() == "":
-        return False, "Please provide an industry name."
-    try:
-        prompt = f"""Is the following text a valid industry name or sector?
+if find_pages:
+    ok, result = validate_industry(industry_input)
+    if not ok:
+        st.error(result)
+        st.stop()
 
-Text: "{industry_input}"
+    st.session_state.industry = result
+    st.session_state.report = ""  # reset report when industry changes
 
-Respond with only "YES" if it's a valid industry/sector (e.g., "automotive", "healthcare", "technology", "retail").
-Respond with only "NO" if it's not (e.g., random words, questions, commands).
+    with st.spinner("Retrieving relevant Wikipedia pages..."):
+        docs = retrieve_wikipedia_docs(st.session_state.industry, lang="en", max_docs=5)
+        st.session_state.docs = docs
+        st.session_state.urls = docs_to_urls(docs, lang="en")
 
-Response:"""
-        result = get_llm_response(api_key, prompt).upper()
-        if "YES" in result:
-            return True, industry_input.strip()
-        else:
-            return False, "This doesn't appear to be a valid industry. Please provide an industry name (e.g., 'automotive', 'healthcare', 'technology')."
-    except Exception as e:
-        return False, f"Error validating industry: {str(e)}"
-
-def get_wikipedia_urls(industry, api_key):
-    """Step 2: Get the 5 most relevant Wikipedia URLs"""
-    try:
-        search_results = wikipedia.search(industry, results=10)
-        candidates = []
-        for title in search_results:
-            url = f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}"
-            candidates.append(url)
-
-        prompt = f"""You are helping with market research for the "{industry}" industry.
-
-Select the 5 MOST relevant Wikipedia URLs for understanding this industry from a business perspective.
-
-Candidates:
-{chr(10).join([f"{i+1}. {url}" for i, url in enumerate(candidates)])}
-
-Respond with ONLY the 5 URLs, one per line, no numbering or explanations:"""
-
-        response = get_llm_response(api_key, prompt)
-        selected = [u.strip() for u in response.split('\n') if u.strip().startswith('http')]
-        return selected[:5] if len(selected) >= 5 else selected
-
-    except Exception as e:
-        st.error(f"Error retrieving Wikipedia URLs: {str(e)}")
-        return []
-
-def generate_report(industry, urls, api_key):
-    """Step 3: Generate industry report from Wikipedia content"""
-    try:
-        all_content = []
-        for url in urls:
-            title = url.split('/wiki/')[-1].replace('_', ' ')
-            try:
-                page = wikipedia.page(title, auto_suggest=False)
-                all_content.append(page.content[:3000])
-            except:
-                try:
-                    results = wikipedia.search(title, results=1)
-                    if results:
-                        page = wikipedia.page(results[0], auto_suggest=False)
-                        all_content.append(page.content[:3000])
-                except:
-                    continue
-
-        combined = "\n\n---\n\n".join(all_content)
-
-        prompt = f"""You are a business analyst writing a market research report on the {industry} industry.
-
-Based on the Wikipedia content below, write a comprehensive industry report covering:
-1. Industry overview
-2. Key players and companies
-3. Market trends
-4. Challenges and opportunities
-5. Future outlook
-
-Requirements:
-- Less than 500 words
-- Professional business tone
-- Based ONLY on the provided content
-
-Wikipedia Content:
-{combined[:12000]}
-
-Write the industry report:"""
-
-        report = get_llm_response(api_key, prompt)
-
-        if len(report.split()) > 500:
-            condense = f"Condense this report to under 500 words, keeping all key information:\n\n{report}"
-            report = get_llm_response(api_key, condense)
-
-        return report
-
-    except Exception as e:
-        st.error(f"Error generating report: {str(e)}")
-        return ""
-
-# Main workflow
-st.markdown("---")
-st.subheader("🔍 Step 1: Enter Industry")
-industry_input = st.text_input(
-    "What industry would you like to research?",
-    value=st.session_state.industry,
-    placeholder="e.g., automotive, healthcare, renewable energy"
-)
-
-if st.button("🚀 Start Research", type="primary", use_container_width=True):
-    if not api_key:
-        st.error("⚠️ Please enter your API key in the sidebar first!")
-    else:
-        with st.spinner("Validating industry..."):
-            is_valid, result = validate_industry(industry_input, api_key)
-
-        if is_valid:
-            st.success(f"✅ Valid industry: {result}")
-            st.session_state.industry = result
-            st.session_state.step = 2
-
-            with st.spinner("🔎 Finding relevant Wikipedia pages..."):
-                urls = get_wikipedia_urls(st.session_state.industry, api_key)
-
-            if urls:
-                st.session_state.urls = urls
-                st.session_state.step = 3
-
-                with st.spinner("📝 Generating industry report..."):
-                    report = generate_report(st.session_state.industry, st.session_state.urls, api_key)
-
-                if report:
-                    st.session_state.report = report
-                    st.session_state.step = 4
-                else:
-                    st.error("Failed to generate report. Please try again.")
-            else:
-                st.error("Failed to retrieve Wikipedia URLs. Please try again.")
-        else:
-            st.error(f"❌ {result}")
-
-# Display results
-if st.session_state.step >= 3 and st.session_state.urls:
+# Step 2 (Q2)
+if st.session_state.urls:
     st.markdown("---")
-    st.subheader("📚 Step 2: Relevant Wikipedia Pages")
-    for i, url in enumerate(st.session_state.urls, 1):
-        st.markdown(f"{i}. [{url}]({url})")
+    st.subheader("Step 2 — Five most relevant Wikipedia pages (Q2)")
+    for i, url in enumerate(st.session_state.urls[:5], start=1):
+        st.markdown(f"{i}. {url}")
 
-if st.session_state.step >= 4 and st.session_state.report:
+# Step 3 (Q3)
+if st.session_state.docs:
     st.markdown("---")
-    st.subheader("📊 Step 3: Industry Report")
-    st.markdown(st.session_state.report)
-    word_count = len(st.session_state.report.split())
-    st.caption(f"📝 Word count: {word_count} words")
+    st.subheader("Step 3 — Generate industry report (Q3)")
+
+    api_key = api_key_input.strip() or os.getenv("GROQ_API_KEY", "").strip()
+
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button("Generate Report", type="primary", use_container_width=True):
+            if not api_key:
+                st.error("Please enter your Groq API key in the sidebar to generate the report.")
+                st.stop()
+
+            with st.spinner("Generating report with Groq..."):
+                llm = make_llm(api_key=api_key, model_id=llm_model, temperature=0.2)
+                report = generate_industry_report(llm, st.session_state.industry, st.session_state.docs, max_words=500)
+                st.session_state.report = report
+
+    with col2:
+        if st.button("New Research", use_container_width=True):
+            st.session_state.industry = ""
+            st.session_state.docs = []
+            st.session_state.urls = []
+            st.session_state.report = ""
+            st.rerun()
+
+# Display report
+if st.session_state.report:
+    st.markdown("---")
+    st.subheader("Industry Report")
+    st.write(st.session_state.report)
+    wc = word_count(st.session_state.report)
+    st.caption(f"Word count: {wc} (limit: 500)")
+
     st.download_button(
-        label="📥 Download Report",
+        label="Download Report (.txt)",
         data=st.session_state.report,
-        file_name=f"{st.session_state.industry}_report.txt",
-        mime="text/plain"
+        file_name=f"{st.session_state.industry.replace(' ', '_')}_report.txt",
+        mime="text/plain",
+        use_container_width=True,
     )
 
-if st.session_state.step > 1:
-    if st.button("🔄 New Research", use_container_width=True):
-        st.session_state.step = 1
-        st.session_state.industry = ""
-        st.session_state.urls = []
-        st.session_state.report = ""
-        st.rerun()
-
 st.markdown("---")
-st.markdown(
-    "<div style='text-align:center;color:#666;font-size:0.9em;'>Built with Streamlit & Google Gemini Flash | Market Research Assistant</div>",
-    unsafe_allow_html=True
-)
+st.caption("Built with Streamlit + LangChain WikipediaRetriever + Groq (Llama 3.1 8B Instant).")
