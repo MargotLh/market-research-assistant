@@ -8,7 +8,7 @@ from langchain_core.documents import Document
 
 
 # -----------------------------
-# Helpers (testable)
+# Helpers
 # -----------------------------
 def validate_industry(industry_input: str) -> Tuple[bool, str]:
     """Q1: check that an industry is provided."""
@@ -56,69 +56,20 @@ def make_llm(api_key: str, model_id: str, temperature: float = 0.2) -> ChatGroq:
 
 
 # -----------------------------
-# Wikipedia relevance reranker
+# Wikipedia retrieval + LLM reranking
 # -----------------------------
-def score_wiki_doc(title: str, content: str, query: str) -> int:
-    """
-    Heuristic score — generous boosts, only hard negatives penalised.
-    """
-    t = (title or "").lower()
-    c = (content or "").lower()
-    q = (query or "").lower()
-
-    score = 0
-
-    # Strong boost: query words appear in title
-    query_words = [w for w in q.split() if len(w) > 3]
-    for w in query_words:
-        if w in t:
-            score += 10
-
-    # Industry / market keywords in title
-    for kw in ["industry", "sector", "market", "economics", "economy",
-               "manufacturing", "production", "trade", "commerce",
-               "value chain", "supply chain", "health", "technology",
-               "energy", "finance", "retail", "services"]:
-        if kw in t:
-            score += 5
-        if kw in c:
-            score += 1
-
-    # General business relevance in content
-    for kw in ["company", "companies", "business", "revenue", "billion",
-               "growth", "regulation", "employment", "export", "import"]:
-        if kw in c:
-            score += 1
-
-    # Penalise only very clearly off-topic pages (events, media, crimes)
-    hard_negatives = [
-        "killing", "murder", "shooting", "attack", "trial",
-        "television episode", "video game", "discography",
-        "filmography", "soundtrack"
-    ]
-    for bad in hard_negatives:
-        if bad in t:
-            score -= 20
-
-    return score
-
-
 @st.cache_data(show_spinner=False)
 def retrieve_wikipedia_docs(query: str, lang: str = "en", max_docs: int = 5) -> List[Document]:
     """
-    Q2: return up to 5 relevant Wikipedia docs using multiple query variants.
+    Q2: Retrieve Wikipedia candidates then deduplicate by title.
+    LLM reranking is done separately (needs api_key).
     """
-    retriever = WikipediaRetriever(
-        lang=lang,
-        top_k_results=10,
-        load_max_docs=10,
-    )
+    retriever = WikipediaRetriever(lang=lang, top_k_results=8, load_max_docs=8)
 
     candidate_queries = [
         f"{query} industry",
         f"{query} market",
         f"{query} sector",
-        f"{query} economics",
         query,
     ]
 
@@ -133,20 +84,50 @@ def retrieve_wikipedia_docs(query: str, lang: str = "en", max_docs: int = 5) -> 
             if title and title not in by_title:
                 by_title[title] = d
 
-    scored = []
-    for title, doc in by_title.items():
-        s = score_wiki_doc(title, doc.page_content, query)
-        scored.append((s, doc))
+    return list(by_title.values())
 
-    scored.sort(key=lambda x: x[0], reverse=True)
 
-    return [d for _, d in scored[:max_docs]]
+def rerank_with_llm(llm: ChatGroq, industry: str, docs: List[Document], max_docs: int = 5) -> List[Document]:
+    """
+    Use the LLM to select the most relevant docs for the given industry.
+    """
+    if len(docs) <= max_docs:
+        return docs
+
+    titles = [d.metadata.get("title", f"Doc {i}") for i, d in enumerate(docs)]
+    titles_str = "\n".join([f"{i+1}. {t}" for i, t in enumerate(titles)])
+
+    prompt = f"""You are a market research analyst. A user wants to research the "{industry}" industry.
+
+Below is a list of Wikipedia article titles retrieved for this query.
+Select the {max_docs} titles that are MOST relevant for understanding the "{industry}" industry from a business perspective (market size, companies, trends, etc.).
+
+Titles:
+{titles_str}
+
+Reply with ONLY the numbers of the {max_docs} most relevant titles, comma-separated (e.g. 1,3,5,7,9). Nothing else."""
+
+    response = (llm.invoke(prompt).content or "").strip()
+
+    # Parse the numbers returned by the LLM
+    selected_indices = []
+    for part in response.replace(" ", "").split(","):
+        try:
+            idx = int(part) - 1
+            if 0 <= idx < len(docs):
+                selected_indices.append(idx)
+        except ValueError:
+            continue
+
+    # Fall back to first max_docs if parsing fails
+    if not selected_indices:
+        return docs[:max_docs]
+
+    return [docs[i] for i in selected_indices[:max_docs]]
 
 
 def generate_industry_report(llm: ChatGroq, industry: str, docs: List[Document], max_words: int = 500) -> str:
-    """
-    Q3: report < 500 words, grounded in the 5 retrieved Wikipedia pages.
-    """
+    """Q3: report < 500 words, grounded in the 5 retrieved Wikipedia pages."""
     sources_blocks = []
     for i, d in enumerate(docs[:5], start=1):
         title = (d.metadata or {}).get("title", f"Source {i}")
@@ -155,8 +136,7 @@ def generate_industry_report(llm: ChatGroq, industry: str, docs: List[Document],
 
     sources_text = "\n\n---\n\n".join(sources_blocks)
 
-    prompt = f"""
-You are a business analyst writing a market research brief on the "{industry}" industry.
+    prompt = f"""You are a business analyst writing a market research brief on the "{industry}" industry.
 
 Use ONLY the information in the SOURCES below. Do not add outside facts.
 Write a clear industry report covering:
@@ -179,14 +159,11 @@ SOURCES:
     report = (llm.invoke(prompt).content or "").strip()
 
     if word_count(report) > max_words:
-        tighten = f"""
-Shorten the report to strictly under {max_words} words.
-Keep it accurate and based ONLY on the same sources.
-Remove repetition first.
+        tighten = f"""Shorten the report to strictly under {max_words} words.
+Keep it accurate and based ONLY on the same sources. Remove repetition first.
 
 REPORT TO SHORTEN:
-{report}
-""".strip()
+{report}""".strip()
         report = (llm.invoke(tighten).content or "").strip()
 
     if word_count(report) > max_words:
@@ -209,7 +186,6 @@ with st.sidebar:
         "Select LLM Model",
         ["llama-3.1-8b-instant"],
         index=0,
-        help="Final submission should include only one LLM option.",
     )
 
     api_key_input = st.text_input(
@@ -220,23 +196,16 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### How to use")
-    st.markdown(
-        """
+    st.markdown("""
 1) Enter an industry  
 2) Click **Find Wikipedia Pages** (Q2)  
-3) Paste your Groq key and click **Generate Report** (Q3)
-"""
-    )
+3) Click **Generate Report** (Q3)
+""")
 
-# Session state init
-if "industry" not in st.session_state:
-    st.session_state.industry = ""
-if "docs" not in st.session_state:
-    st.session_state.docs = []
-if "urls" not in st.session_state:
-    st.session_state.urls = []
-if "report" not in st.session_state:
-    st.session_state.report = ""
+# Session state
+for key in ["industry", "docs", "urls", "report"]:
+    if key not in st.session_state:
+        st.session_state[key] = "" if key in ["industry", "report"] else []
 
 # Step 1 (Q1)
 st.subheader("Step 1 — Provide an industry (Q1)")
@@ -244,7 +213,7 @@ with st.form("industry_form", clear_on_submit=False):
     industry_input = st.text_input(
         "What industry would you like to research?",
         value=st.session_state.industry,
-        placeholder="e.g., automotive, healthcare, renewable energy",
+        placeholder="e.g., automotive, healthcare, beauty",
     )
     find_pages = st.form_submit_button("Find Wikipedia Pages", use_container_width=True)
 
@@ -254,13 +223,22 @@ if find_pages:
         st.error(cleaned)
         st.stop()
 
+    api_key = api_key_input.strip()
+    if not api_key:
+        st.error("Please enter your Groq API key in the sidebar first.")
+        st.stop()
+
     st.session_state.industry = cleaned
     st.session_state.report = ""
 
-    with st.spinner("Retrieving relevant Wikipedia pages..."):
-        docs = retrieve_wikipedia_docs(st.session_state.industry, lang="en", max_docs=5)
-        st.session_state.docs = docs
-        st.session_state.urls = docs_to_urls(docs, lang="en")
+    with st.spinner("Retrieving Wikipedia candidates..."):
+        all_docs = retrieve_wikipedia_docs(cleaned, lang="en", max_docs=5)
+
+    with st.spinner("Selecting the 5 most relevant pages..."):
+        llm = make_llm(api_key=api_key, model_id=llm_model, temperature=0.2)
+        selected_docs = rerank_with_llm(llm, cleaned, all_docs, max_docs=5)
+        st.session_state.docs = selected_docs
+        st.session_state.urls = docs_to_urls(selected_docs, lang="en")
 
 # Step 2 (Q2)
 if st.session_state.urls:
@@ -274,27 +252,23 @@ if st.session_state.docs:
     st.markdown("---")
     st.subheader("Step 3 — Generate industry report (Q3)")
 
-    api_key = api_key_input.strip() or os.getenv("GROQ_API_KEY", "").strip()
+    api_key = api_key_input.strip()
 
     col1, col2 = st.columns([1, 1])
     with col1:
         if st.button("Generate Report", type="primary", use_container_width=True):
             if not api_key:
-                st.error("Please enter your Groq API key in the sidebar to generate the report.")
+                st.error("Please enter your Groq API key in the sidebar.")
                 st.stop()
-
-            with st.spinner("Generating report with Groq..."):
+            with st.spinner("Generating report..."):
                 llm = make_llm(api_key=api_key, model_id=llm_model, temperature=0.2)
                 st.session_state.report = generate_industry_report(
                     llm, st.session_state.industry, st.session_state.docs, max_words=500
                 )
-
     with col2:
         if st.button("New Research", use_container_width=True):
-            st.session_state.industry = ""
-            st.session_state.docs = []
-            st.session_state.urls = []
-            st.session_state.report = ""
+            for key in ["industry", "docs", "urls", "report"]:
+                st.session_state[key] = "" if key in ["industry", "report"] else []
             st.rerun()
 
 # Display report
@@ -302,10 +276,8 @@ if st.session_state.report:
     st.markdown("---")
     st.subheader("Industry Report")
     st.write(st.session_state.report)
-
     wc = word_count(st.session_state.report)
     st.caption(f"Word count: {wc} (limit: 500)")
-
     st.download_button(
         label="Download Report (.txt)",
         data=st.session_state.report,
