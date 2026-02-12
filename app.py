@@ -61,7 +61,7 @@ def validate_industry(industry_input, api_key):
     try:
         # Configure Gemini
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-2.0-flash')
         
         # Use LLM to validate if input is indeed an industry
         prompt = f"""Is the following text a valid industry name or sector? 
