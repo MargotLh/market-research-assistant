@@ -10,13 +10,22 @@ from langchain_core.documents import Document
 # -----------------------------
 # Helpers
 # -----------------------------
-def validate_industry(industry_input: str) -> Tuple[bool, str]:
-    """Q1: check that an industry is provided."""
+def validate_industry(industry_input: str, llm: ChatGroq = None) -> Tuple[bool, str]:
+    """Q1: check that a valid industry is provided."""
     if industry_input is None:
         return False, "Please provide an industry name."
     cleaned = industry_input.strip()
     if not cleaned:
         return False, "Please provide an industry name (e.g., automotive, healthcare, retail)."
+
+    # LLM-based validation: check it's a real industry
+    if llm is not None:
+        prompt = f"""Is "{cleaned}" a real, recognisable business industry or sector?
+Reply with only YES or NO. Nothing else."""
+        response = (llm.invoke(prompt).content or "").strip().upper()
+        if not response.startswith("YES"):
+            return False, f'"{cleaned}" does not appear to be a valid industry. Please enter a recognised industry (e.g., automotive, healthcare, retail).'
+
     return True, cleaned
 
 
@@ -218,14 +227,16 @@ with st.form("industry_form", clear_on_submit=False):
     find_pages = st.form_submit_button("Find Wikipedia Pages", use_container_width=True)
 
 if find_pages:
-    ok, cleaned = validate_industry(industry_input)
-    if not ok:
-        st.error(cleaned)
-        st.stop()
-
     api_key = api_key_input.strip()
     if not api_key:
         st.error("Please enter your Groq API key in the sidebar first.")
+        st.stop()
+
+    # Validate industry using LLM (temperature=0 for deterministic yes/no)
+    llm_validator = make_llm(api_key=api_key, model_id=llm_model, temperature=0.0)
+    ok, cleaned = validate_industry(industry_input, llm=llm_validator)
+    if not ok:
+        st.error(cleaned)
         st.stop()
 
     st.session_state.industry = cleaned
